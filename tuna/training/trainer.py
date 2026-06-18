@@ -41,11 +41,26 @@ def build_default_callbacks(cfg: DictConfig) -> list[Callback]:
     ckpt_dir = os.path.join(output_dir, "checkpoints")
     save_every = int(cfg.training.get("save_every", 1000))
     keep_last = int(cfg.training.get("keep_last", 3))
+    # Auto-pick save_format based on FSDP state_dict_type when not explicitly set.
+    # SHARDED_STATE_DICT requires DCP; FULL_STATE_DICT works with torch.save.
+    save_format = cfg.training.get("save_format", None)
+    if save_format is None:
+        state_dict_type = (
+            cfg.training.get("fsdp", {}).get("state_dict_type", "FULL_STATE_DICT")
+            if cfg.training.get("fsdp", {}).get("enable", False)
+            else "FULL_STATE_DICT"
+        )
+        save_format = "dcp" if state_dict_type == "SHARDED_STATE_DICT" else "torch"
+    use_safetensors = bool(cfg.training.get("use_safetensors", False))
+    save_optimizer = bool(cfg.training.get("save_optimizer", True))
     callbacks.append(
         LocalCheckpointCallback(
             checkpoint_dir=ckpt_dir,
             save_every_n_steps=save_every,
             keep_last=keep_last,
+            use_safetensors=use_safetensors,
+            save_optimizer=save_optimizer,
+            save_format=save_format,
         )
     )
     # Periodic garbage collection to free GPU memory fragmentation.

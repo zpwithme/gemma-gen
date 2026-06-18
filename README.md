@@ -45,7 +45,7 @@
 | [`configs/model/tuna_2_pixel_gemma_12b.yaml`](configs/model/tuna_2_pixel_gemma_12b.yaml) | 104 | 模型 config(所有开关) |
 | [`configs/predict/t2v_pixel_gemma.yaml`](configs/predict/t2v_pixel_gemma.yaml) | 39 | AR 视频推理 config |
 
-### 2.2 修改文件(6 个)
+### 2.2 修改文件(8 个)
 
 | 文件 | diff stat | 改动摘要 |
 |---|---|---|
@@ -55,6 +55,8 @@
 | `tuna/inference/runner.py` | +50 / -1 | 注册 `Tuna2PixelARVideoPipeline` + `t2v_ar` mode dispatch |
 | `tuna/scripts/predict.py` | +5 | `_make_data_for_mode` 支持 `t2v_ar` |
 | `tuna/pipelines/__init__.py` | +2 | export `Tuna2PixelARVideoPipeline` |
+| `tuna/training/callbacks/checkpoint.py` | +~80 | 新增 `save_format="dcp"`,SHARDED FSDP 自动用 `torch.distributed.checkpoint` |
+| `tuna/training/trainer.py` | +~20 | `build_default_callbacks` 根据 `fsdp.state_dict_type` 自动选 ckpt 格式 |
 
 ---
 
@@ -757,6 +759,80 @@ if self.inference_mode == "t2v_ar":
 
 ---
 
+### K. 训练基础设施 & 评测工具(新增)
+
+跟模型架构改动配套,本 fork 还重写了 ckpt 保存逻辑、加了 FSDP 合并脚本以及两个端到端的评测驱动。
+
+#### K.1 DCP 格式 checkpoint 保存
+
+**原理**:Tuna-2 原始 `LocalCheckpointCallback` 用 `torch.save(module.state_dict())` 在 rank 0 上写文件。**这只在 FSDP `FULL_STATE_DICT` 下安全** —— 用 `SHARDED_STATE_DICT` 时 rank 0 只看到自己的 shard,保存的文件残缺。
+
+**修复**:加 `save_format: "torch" | "dcp"` 选项,自动根据 FSDP 配置选择:
+- `FULL_STATE_DICT` → `"torch"`(单文件 `step_N/model.pt`)
+- `SHARDED_STATE_DICT` → `"dcp"`(每 rank 写分片 `*.distcp` + `.metadata`)
+
+**参考**:
+- 原 callback:`tuna/training/callbacks/checkpoint.py` (LocalCheckpointCallback)
+- PyTorch DCP API:[`torch.distributed.checkpoint`](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html)
+
+**实现**(`tuna/training/callbacks/checkpoint.py:_save_dcp`):
+
+```python
+def _save_dcp(self, unit, module, step_dir, rank, step):
+    import torch.distributed.checkpoint as dcp
+    state = {"model": module.state_dict()}
+    if self.save_optimizer and unit.optimizer is not None:
+        state["optimizer"] = unit.optimizer.state_dict()
+    storage_writer = dcp.FileSystemWriter(step_dir)
+    dcp.save(state_dict=state, storage_writer=storage_writer)
+    if rank == 0:
+        torch.save({"step": step, "lr_scheduler": ...}, f"{step_dir}/meta.pt")
+```
+
+**自动选格式**(`tuna/training/trainer.py:build_default_callbacks`):
+```python
+save_format = cfg.training.get("save_format", None)
+if save_format is None:
+    state_dict_type = cfg.training.fsdp.get("state_dict_type", "FULL_STATE_DICT")
+    save_format = "dcp" if state_dict_type == "SHARDED_STATE_DICT" else "torch"
+```
+
+#### K.2 FSDP merge 脚本
+
+文件:[`tuna/scripts/merge_fsdp_ckpt.py`](tuna/scripts/merge_fsdp_ckpt.py)(292 行)
+
+**作用**:把训练时的 DCP 分片 checkpoint 合并成单文件 `.pt` 或 `.safetensors`,可直接喂给推理 `use_ckpt`。**离线运行,不需要 GPU**。
+
+**核心逻辑**(`_load_dcp`):用 `dcp.FileSystemReader` 读 `.metadata`,根据 `state_dict_metadata` 构造空 tensor 容器,然后 `dcp.load` 离线材料化(no-pg)。
+
+#### K.3 图像评测驱动
+
+文件:[`tuna/scripts/eval_image.py`](tuna/scripts/eval_image.py)(405 行)
+
+**功能**:
+- 从 `.txt`(一行一 prompt)或 `.jsonl`(带 GenEval 字段)读 prompts
+- 批量 T2I 生成,**断点续跑**(`meta.jsonl` 记进度,中断重跑跳过已完成)
+- 输出布局兼容 GenEval / DPG-Bench / FID 评测
+- 内置 FID(`clean-fid`)+ CLIP score(`torchmetrics`)
+
+**Benchmark 兼容**:
+- GenEval:`meta.jsonl` 携带 `category / include / exclude` 字段
+- DPG-Bench:`images/` 目录直接给 `compute_dpg_bench.py`
+- FID:用 `clean-fid` 标准接口
+
+#### K.4 视频评测驱动
+
+文件:[`tuna/scripts/eval_video.py`](tuna/scripts/eval_video.py)(476 行)
+
+**功能**:
+- 调用 `Tuna2PixelARVideoPipeline.t2v_ar` 生成视频
+- 编码 MP4(优先 `imageio[ffmpeg]`,fallback OpenCV)
+- 可选 dump 帧 PNG(`--save-frames`,VBench frame-level metrics 用)
+- VBench 兼容,内置可选 vbench package 直接调用
+- 内置 video CLIP score(逐帧平均)
+
+---
+
 ## 4. 使用方式
 
 ### 4.1 安装(同 Tuna-2)
@@ -768,7 +844,63 @@ bash scripts/setup_uv.sh
 source .venv/bin/activate
 ```
 
-### 4.2 S1 图像训练(4-variant 消融)
+可选评测依赖:
+```bash
+pip install clean-fid                          # FID 计算
+pip install 'torchmetrics[multimodal]'         # CLIP score
+pip install vbench                             # VBench 评测
+pip install imageio imageio-ffmpeg             # MP4 编码(高质量 libx264)
+```
+
+### 4.2 端到端 workflow(训练 → merge → 生成 → 评测)
+
+```bash
+# === 1. 训练(SHARDED FSDP 自动保 DCP 格式)===
+torchrun --standalone --nproc-per-node=8 -m tuna.scripts.train \
+    --config-name train_gemma \
+    model.vision_encoder_type=bottleneck \
+    model.enable_pixelrepa=true \
+    training.output_dir=./outputs/s1/F_full
+
+# 输出:./outputs/s1/F_full/checkpoints/step_<N>/ (DCP dir)
+
+# === 2. 合并 ckpt 给推理用 ===
+python -m tuna.scripts.merge_fsdp_ckpt \
+    --src ./outputs/s1/F_full/checkpoints/step_50000 \
+    --dst ./outputs/s1/F_full/merged/step_50000.pt
+
+# === 3a. 单 prompt 生图(快速 demo)===
+python -m tuna.scripts.predict --config-name t2i \
+    inference.ckpt_path=./outputs/s1/F_full/merged/step_50000.pt \
+    prompt="A highly realistic close-up portrait of a young woman"
+
+# === 3b. 批量评测图像(GenEval / DPG / FID)===
+python -m tuna.scripts.eval_image \
+    --model-config configs/model/tuna_2_pixel_gemma_12b.yaml \
+    --ckpt ./outputs/s1/F_full/merged/step_50000.pt \
+    --prompts assets/prompts.txt \
+    --output-dir ./eval/s1_F_full \
+    --height 512 --width 512 --guidance 4.0 --steps 50 \
+    --fid-ref /data/mjhq30k/images \
+    --clip-score
+
+# === 4. 视频训练(V-S2 → V-S3,看 §4.4)→ merge → 生成视频 ===
+python -m tuna.scripts.predict --config-name t2v_pixel_gemma \
+    inference.ckpt_path=./outputs/video/V-S3/merged/step_30000.pt \
+    prompt="A cat walking on the beach at sunset, photorealistic"
+
+# === 5. 批量评测视频(VBench)===
+python -m tuna.scripts.eval_video \
+    --model-config configs/model/tuna_2_pixel_gemma_12b.yaml \
+    --ckpt ./outputs/video/V-S3/merged/step_30000.pt \
+    --prompts vbench_prompts.txt \
+    --output-dir ./eval/video_v_s3 \
+    --num-frames 16 --frames-per-chunk 4 --height 512 --width 512 --fps 8 \
+    --vbench-dimensions subject_consistency motion_smoothness aesthetic_quality \
+    --clip-score
+```
+
+### 4.3 S1 图像训练(4-variant 消融)
 
 ```bash
 # Variant A:Qwen baseline(原 Tuna-2 复现)
@@ -795,43 +927,209 @@ RUN_NAME=s1_F torchrun --standalone --nproc-per-node=8 \
     training.output_dir=./outputs/s1/F_full
 ```
 
-### 4.3 视频训练(3 阶段)
+### 4.4 视频训练(3 阶段)
 
 ```bash
 # V-S2: 双向 teacher(image + 短视频联合)
 torchrun ... -m tuna.scripts.train \
     --config-name video_t2v_pixel_gemma \
     training.stage=joint_bidir \
-    model.load_stage1_model=./outputs/s1/F_full/checkpoints/last.pt
+    model.load_stage1_model=./outputs/s1/F_full/merged/step_50000.pt
 
-# V-S3: AR teacher forcing(cross-frame causal)
+# V-S3: AR teacher forcing(cross-frame causal 自动开)
 torchrun ... -m tuna.scripts.train \
     --config-name video_t2v_pixel_gemma \
     training.stage=ar_teacher_force \
-    model.load_stage1_model=./outputs/video/V-S2/last.pt
+    model.load_stage1_model=./outputs/video/V-S2/merged/step_10000.pt
 
 # V-S4: Mean Flow 蒸馏到 4-step
 torchrun ... -m tuna.scripts.train \
     --config-name video_t2v_pixel_gemma \
     training.stage=mean_flow_distill \
-    mean_flow.teacher_ckpt=./outputs/video/V-S3/last.pt
+    mean_flow.teacher_ckpt=./outputs/video/V-S3/merged/step_10000.pt
 ```
 
-### 4.4 AR 视频推理
+### 4.5 图像生成(单 prompt 推理 / 批量评测两种方式)
+
+#### 4.5.1 单 prompt 快速生图(Hydra CLI)
+
+```bash
+# 基础 T2I,默认 config 是 t2i.yaml(配模型为 tuna_2_pixel_7b)
+python -m tuna.scripts.predict --config-name t2i \
+    inference.ckpt_path=./outputs/s1/F_full/merged/step_50000.pt \
+    prompt="A photorealistic portrait of a young woman with auburn hair"
+
+# 用我们的 Gemma 12B 模型 + bottleneck + PixelREPA
+python -m tuna.scripts.predict --config-name t2i \
+    model=tuna_2_pixel_gemma_12b \
+    model.vision_encoder_type=bottleneck \
+    model.enable_pixelrepa=false \
+    inference.pipe=Tuna2PixelPipeline \
+    inference.ckpt_path=./outputs/s1/F_full/merged/step_50000.pt \
+    inference.height=1024 inference.width=1024 \
+    inference.guidance_scale=3.0 \
+    prompt="A surreal close-up photograph of a face with intricate details"
+```
+
+#### 4.5.2 图像编辑
+
+```bash
+python -m tuna.scripts.predict --config-name edit \
+    inference.ckpt_path=./outputs/s1/F_full/merged/step_50000.pt \
+    image_path=./assets/source.png \
+    instruction="add warm golden sunset lighting to the scene"
+```
+
+#### 4.5.3 多模态理解(MMU)
+
+```bash
+python -m tuna.scripts.predict --config-name mmu \
+    inference.ckpt_path=./outputs/s1/F_full/merged/step_50000.pt \
+    image_path=./assets/photo.jpg
+```
+
+#### 4.5.4 批量评测图像(GenEval / DPG-Bench / MJHQ-30k FID)
+
+```bash
+# 写一个 prompts 文件
+echo "A photo of a cat" > /tmp/prompts.txt
+echo "An astronaut floating in space" >> /tmp/prompts.txt
+
+# 跑生成 + FID + CLIP
+python -m tuna.scripts.eval_image \
+    --model-config configs/model/tuna_2_pixel_gemma_12b.yaml \
+    --ckpt ./outputs/s1/F_full/merged/step_50000.pt \
+    --prompts /tmp/prompts.txt \
+    --output-dir ./eval/s1_F_full \
+    --height 512 --width 512 \
+    --steps 50 --guidance 4.0 \
+    --pipe Tuna2PixelPipeline \
+    --fid-ref /data/mjhq30k/images \
+    --clip-score
+
+# 只算 metric(skip generation)
+python -m tuna.scripts.eval_image \
+    --output-dir ./eval/s1_F_full \
+    --skip-gen --fid-ref /data/mjhq30k/images --clip-score
+```
+
+输出文件:
+```
+eval/s1_F_full/
+  meta.jsonl              # 每张图的 prompt + path + (category/tag)
+  images/
+    00000_<slug>.png
+    00001_<slug>.png ...
+  metrics.json            # {"fid": ..., "clip_score": ...}
+```
+
+### 4.6 视频生成(AR + 批量评测)
+
+#### 4.6.1 单 prompt 生视频
+
+```bash
+# AR 视频,默认 16 帧 × 4 frames-per-chunk × 8 diffusion steps
+python -m tuna.scripts.predict --config-name t2v_pixel_gemma \
+    inference.ckpt_path=./outputs/video/V-S3/merged/step_30000.pt \
+    prompt="A cat walking on the beach at sunset, photorealistic"
+
+# 覆盖 chunk/step/frame 数(更长或更快)
+python -m tuna.scripts.predict --config-name t2v_pixel_gemma \
+    inference.ckpt_path=./outputs/video/V-S3/merged/step_30000.pt \
+    inference.num_frames=32 \
+    inference.frames_per_chunk=4 \
+    inference.num_diffusion_steps_per_chunk=4 \
+    inference.guidance_scale=4.0 \
+    prompt="A drone shot flying over a snowy mountain range at dawn"
+```
+
+#### 4.6.2 用 Mean Flow 蒸馏后的 few-step student
 
 ```bash
 python -m tuna.scripts.predict --config-name t2v_pixel_gemma \
-    prompt="A cat walking on the beach at sunset, photorealistic"
+    inference.ckpt_path=./outputs/video/V-S4/merged/step_5000.pt \
+    inference.use_mean_flow=true \
+    inference.mean_flow_intervals=4 \
+    inference.num_diffusion_steps_per_chunk=2 \
+    prompt="A dog running through a forest"
 ```
 
-### 4.5 Smoke test(单卡快速验证)
+#### 4.6.3 批量评测视频(VBench)
 
 ```bash
+# 先准备 VBench prompts(可从 VBench 官方拿)
+# vbench_prompts.txt:每行一条 prompt
+
+python -m tuna.scripts.eval_video \
+    --model-config configs/model/tuna_2_pixel_gemma_12b.yaml \
+    --ckpt ./outputs/video/V-S3/merged/step_30000.pt \
+    --prompts vbench_prompts.txt \
+    --output-dir ./eval/video_v_s3 \
+    --num-frames 16 --frames-per-chunk 4 \
+    --height 512 --width 512 \
+    --steps-per-chunk 8 \
+    --guidance 4.0 --fps 8 \
+    --vbench-dimensions subject_consistency motion_smoothness aesthetic_quality \
+    --clip-score \
+    --save-frames        # 同时 dump 每帧 PNG(VBench frame-level metrics 用)
+```
+
+输出文件:
+```
+eval/video_v_s3/
+  meta.jsonl                       # prompt + video_path + num_frames + fps + gen_time
+  videos/
+    00000_<slug>.mp4
+    00001_<slug>.mp4 ...
+  frames/                          # 可选(--save-frames)
+    00000_<slug>/
+      frame_000.png  frame_001.png ...
+  vbench/                          # VBench 中间结果
+  metrics.json                     # {"vbench": {...}, "clip_score_video": ...}
+```
+
+### 4.7 FSDP ckpt 合并(SHARDED → 单文件)
+
+```bash
+# DCP 目录 → 单文件 .pt(默认)
+python -m tuna.scripts.merge_fsdp_ckpt \
+    --src ./outputs/s1/F_full/checkpoints/step_50000 \
+    --dst ./outputs/s1/F_full/merged/step_50000.pt
+
+# 或 .safetensors(只存 model,不含 optimizer,更小)
+python -m tuna.scripts.merge_fsdp_ckpt \
+    --src ./outputs/s1/F_full/checkpoints/step_50000 \
+    --dst ./outputs/s1/F_full/merged/step_50000.safetensors \
+    --format safetensors
+
+# 同时保留 optimizer(用于断点续训)
+python -m tuna.scripts.merge_fsdp_ckpt \
+    --src ./outputs/s1/F_full/checkpoints/step_50000 \
+    --dst ./outputs/s1/F_full/merged/step_50000_full.pt \
+    --include-optimizer
+```
+
+**注意**:
+- merge 脚本**纯 CPU 即可**,无需 GPU
+- 自动检测 src 是 DCP 目录还是单文件 `.pt`(都支持)
+- 合并后的输出**直接兼容** `tuna.inference.checkpoint_loader.load_checkpoint`
+
+### 4.8 Smoke test(单卡快速验证)
+
+```bash
+# 训练 smoke test(4 步,batch 1,无 FSDP)
 python -m tuna.scripts.train \
     --config-name train_gemma \
     training.max_steps_per_epoch=4 \
     training.batch_size=1 \
     training.fsdp.enable=false
+
+# 推理 smoke test(快速验证 ckpt 能加载、能出图)
+python -m tuna.scripts.predict --config-name t2i \
+    inference.ckpt_path=./outputs/.../step_4/model.pt \
+    inference.height=256 inference.width=256 \
+    inference.num_inference_steps=4 \
+    prompt="test"
 ```
 
 ---
