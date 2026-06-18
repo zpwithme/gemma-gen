@@ -542,7 +542,11 @@ def get_text_tokenizer(
     model_path, add_tuna_tokens=True, return_tuna_token_ids=False, llm_name="qwen2_5"
 ):
     text_tokenizer = AutoTokenizer.from_pretrained(model_path)
-    text_tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+    # Only add a PAD token if the tokenizer doesn't already have one. Gemma
+    # ships with <pad>; injecting a new "[PAD]" wastes an embedding row and
+    # creates two distinct pad ids.
+    if text_tokenizer.pad_token is None:
+        text_tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     if add_tuna_tokens:
         if llm_name == "llama3":
             text_tokenizer.add_tokens("<|img_start|>")
@@ -556,8 +560,23 @@ def get_text_tokenizer(
             text_tokenizer.add_tokens("<image>")
             text_tokenizer.add_tokens("<|vid_start|>")
             text_tokenizer.add_tokens("<|vid_end|>")
+        elif llm_name == "gemma4":
+            # Gemma 4 already has pretrained vision tokens we should REUSE
+            # (start_of_image / end_of_image / image_soft_token). We only add
+            # tokens Tuna needs that Gemma doesn't ship: video bookends, an
+            # explicit video pad, and the <image> placeholder used in chat
+            # templates by some datasets.
+            vocab = text_tokenizer.get_vocab()
+            if "<|vid_start|>" not in vocab:
+                text_tokenizer.add_tokens("<|vid_start|>")
+            if "<|vid_end|>" not in vocab:
+                text_tokenizer.add_tokens("<|vid_end|>")
+            if "<|video_pad|>" not in vocab:
+                text_tokenizer.add_tokens("<|video_pad|>")
+            if "<image>" not in vocab:
+                text_tokenizer.add_tokens("<image>")
         else:
-            raise NotImplementedError
+            raise NotImplementedError(f"Unknown llm_name: {llm_name}")
 
     if return_tuna_token_ids:
         if llm_name == "llama3":
@@ -584,8 +603,41 @@ def get_text_tokenizer(
                 "vid_pad_id": text_tokenizer.get_vocab()["<|video_pad|>"],
                 "img_id": text_tokenizer.get_vocab()["<image>"],
             }
+        elif llm_name == "gemma4":
+            vocab = text_tokenizer.get_vocab()
+
+            def _resolve(*candidates, attr=None):
+                """Return the first candidate that exists in vocab, else attr-based fallback."""
+                for c in candidates:
+                    if c in vocab:
+                        return vocab[c]
+                if attr is not None:
+                    val = getattr(text_tokenizer, attr, None)
+                    if val is not None:
+                        return val
+                raise KeyError(f"None of {candidates} found in Gemma tokenizer vocab")
+
+            tuna_token_ids = {
+                # Use Gemma's PRETRAINED special tokens; fall back to tokenizer
+                # attributes when vocab lookup fails (different Gemma releases
+                # use slightly different names).
+                "bos_id": text_tokenizer.bos_token_id,
+                "eos_id": text_tokenizer.eos_token_id,
+                # Image bookends: prefer Gemma's native pretrained tokens
+                # so we keep the vision-language alignment from pretraining.
+                "boi_id": _resolve("<start_of_image>", "<|vision_start|>"),
+                "eoi_id": _resolve("<end_of_image>", "<|vision_end|>"),
+                # Image-pad: Gemma 4 unified uses "<image_soft_token>"
+                # as its per-patch placeholder; that's the right slot.
+                "img_pad_id": _resolve("<image_soft_token>", "<|image_pad|>"),
+                # Video bookends + pad are Tuna-added (Gemma has no native videos).
+                "bov_id": vocab["<|vid_start|>"],
+                "eov_id": vocab["<|vid_end|>"],
+                "vid_pad_id": vocab["<|video_pad|>"],
+                "img_id": vocab["<image>"],
+            }
         else:
-            raise NotImplementedError
+            raise NotImplementedError(f"Unknown llm_name: {llm_name}")
 
         return text_tokenizer, tuna_token_ids
 

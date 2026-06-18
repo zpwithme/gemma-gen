@@ -40,6 +40,7 @@ from tuna.models.vae.wan22_vae import Wan2_2_VAE
 from tuna.pipelines.tuna_2_pixel_pipeline import Tuna2PixelPipeline
 from tuna.pipelines.tuna_2r_pixel_pipeline import Tuna2RPixelPipeline
 from tuna.pipelines.tuna_pipeline import TunaPipeline
+from tuna.pipelines.tuna_2_pixel_ar_video_pipeline import Tuna2PixelARVideoPipeline
 
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -334,6 +335,29 @@ class TunaInference:
             self.pipe = Tuna2RPixelPipeline(vae_model=vae_model, **common_kwargs)
         elif pipe == "Tuna2PixelPipeline" or pipe is None:
             self.pipe = Tuna2PixelPipeline(**common_kwargs)
+        elif pipe == "Tuna2PixelARVideoPipeline":
+            # AR video pipeline takes a subset of common_kwargs + video-specific.
+            ar_kwargs = {
+                "model": self.model,
+                "text_tokenizer": getattr(self.model, "text_tokenizer", None),
+                "tuna_token_ids": getattr(self.model, "tuna_token_ids", None),
+                "config": config,
+                "weight_dtype": self.weight_dtype,
+                "device": self.device,
+                "use_tf32": True,
+                "use_chat_template": self.use_chat_template,
+                "height": self.height,
+                "width": self.width,
+                "add_aspect_ratio_embeds": self.add_aspect_ratio_embeds,
+                "num_frames": getattr(self, "num_frames", self.latent_frames or 16),
+                "frames_per_chunk": getattr(self, "frames_per_chunk", 4),
+                "num_diffusion_steps_per_chunk": getattr(
+                    self, "num_diffusion_steps_per_chunk", 8
+                ),
+                "patch_size": getattr(self, "patch_size", 16),
+                "max_seq_len": getattr(self, "max_seq_len", 8192),
+            }
+            self.pipe = Tuna2PixelARVideoPipeline(**ar_kwargs)
         else:
             raise ValueError(f"Unknown pipeline name: {pipe!r}")
 
@@ -382,10 +406,35 @@ class TunaInference:
             return self.edit(data, **kwargs)
         if self.inference_mode == "mmu":
             return self.mmu(data, **kwargs)
+        if self.inference_mode == "t2v_ar":
+            return self.t2v_ar(data, **kwargs)
         raise ValueError(
             f"Unknown inference mode: {self.inference_mode!r}. "
-            "Supported modes are 't2i', 'edit', 'mmu'."
+            "Supported modes are 't2i', 'edit', 'mmu', 't2v_ar'."
         )
+
+    # ---- t2v_ar (pixel-space AR video) --------------------------------------
+    def t2v_ar(self, data: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        """Pixel-space autoregressive video generation."""
+        prompts = data.get("sentence", data.get("text", []))
+        if isinstance(prompts, str):
+            prompts = [prompts]
+        if not prompts:
+            raise ValueError("t2v_ar requires at least one prompt")
+
+        seed = kwargs.get("seed", 42)
+        guidance_scale = kwargs.get("guidance_scale", self.guidance_scale)
+        noise_scale = kwargs.get("noise_scale", self.noise_scale)
+
+        with torch.inference_mode():
+            pil_frames = self.pipe.t2v_ar(
+                prompt=prompts[0],
+                guidance_scale=guidance_scale,
+                noise_scale=noise_scale,
+                negative_prompt=self.negative_prompt,
+                seed=seed,
+            )
+        return {"frames": pil_frames, "sentence": prompts}
 
     # ---- t2i ---------------------------------------------------------------
     def t2i(self, data: dict[str, Any], **kwargs: Any) -> dict[str, Any]:

@@ -52,6 +52,11 @@ def _make_data_for_mode(cfg: DictConfig) -> dict:
             raise ValueError("predict (mmu) requires an `image_path` override.")
         image = Image.open(image_path).convert("RGB")
         return {"image": [image]}
+    if mode == "t2v_ar":
+        # Pixel-space AR video generation. Takes only a text prompt; video
+        # frames are produced by the AR pipeline chunk by chunk.
+        prompt = cfg.get("prompt", "a cat walking on the beach")
+        return {"text": prompt if isinstance(prompt, list) else [prompt]}
     raise ValueError(f"Unknown inference_mode: {mode!r}")
 
 

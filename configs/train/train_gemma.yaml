@@ -1,0 +1,137 @@
+# =============================================================================
+# Tuna-2 + Gemma 4 12B training config (S1: IMAGE).
+#
+# 6-variant ablation matrix (set via CLI overrides):
+#
+#   # A. Qwen baseline (compare)
+#   torchrun ... -m tuna.scripts.train \
+#       --config-name train_gemma \
+#       model=tuna_2_pixel_7b \
+#       training.output_dir=./outputs/s1/A_qwen_baseline
+#
+#   # B. +Gemma (main backbone replacement)
+#   torchrun ... -m tuna.scripts.train --config-name train_gemma \
+#       training.output_dir=./outputs/s1/B_gemma_simple
+#
+#   # C. +PixelREPA on Qwen
+#   (requires also wiring Qwen wrapper with PixelREPA — out of scope; skip in v1)
+#
+#   # D. +Gemma+PixelREPA
+#   torchrun ... -m tuna.scripts.train --config-name train_gemma \
+#       model.enable_pixelrepa=true \
+#       training.output_dir=./outputs/s1/D_gemma_repa
+#
+#   # E. +Gemma+Bottleneck
+#   torchrun ... -m tuna.scripts.train --config-name train_gemma \
+#       model.vision_encoder_type=bottleneck \
+#       training.output_dir=./outputs/s1/E_gemma_bottleneck
+#
+#   # F. +Gemma+Bottleneck+PixelREPA (full release)
+#   torchrun ... -m tuna.scripts.train --config-name train_gemma \
+#       model.vision_encoder_type=bottleneck \
+#       model.enable_pixelrepa=true \
+#       training.output_dir=./outputs/s1/F_gemma_full
+# =============================================================================
+
+defaults:
+  - model: tuna_2_pixel_gemma_12b
+  - _self_
+
+# =============================================================================
+# Data — image-only for S1 (4-stream weighted)
+# =============================================================================
+
+data:
+  sync_sampling: true
+  sampling_weights:
+    t2i: 0.60
+    mmu: 0.20
+    edit: 0.10
+    text: 0.10
+
+  streams:
+    t2i:
+      _target_: tuna.data.datasets.ti_dataset.TIDataset
+      jsonl_path: ./data_examples/ti_pairs.jsonl
+      image_root: ./data_examples
+      image_size: 512
+      data_type: t2i
+      max_text_length: 2048
+      center_crop: true
+      multi_resolution: true
+      batch_size: 1
+      num_workers: 8
+
+    edit:
+      _target_: tuna.data.datasets.edit_dataset.EditDataset
+      jsonl_path: ./data_examples/edit_pairs.jsonl
+      image_root: ./data_examples
+      image_size: 512
+      max_text_length: 4096
+      center_crop: true
+      batch_size: 1
+      num_workers: 8
+
+    mmu:
+      _target_: tuna.data.datasets.ti_dataset.TIDataset
+      jsonl_path: ./data_examples/mmu_pairs.jsonl
+      image_root: ./data_examples
+      image_size: 512
+      data_type: mmu
+      max_text_length: 4096
+      center_crop: true
+      multi_resolution: true
+      batch_size: 1
+      num_workers: 8
+
+    text:
+      _target_: tuna.data.datasets.ti_dataset.TIDataset
+      jsonl_path: ./data_examples/text_only.jsonl
+      image_root: ./data_examples
+      image_size: 512
+      data_type: mmu_text
+      max_text_length: 4096
+      center_crop: true
+      batch_size: 3
+      num_workers: 8
+
+# =============================================================================
+# Training
+# =============================================================================
+
+training:
+  output_dir: ./outputs/train_gemma
+
+  max_epochs: 1
+  max_steps_per_epoch: 100000
+  learning_rate: 2.0e-5
+  weight_decay: 1.0e-2
+  warmup_steps: 1000
+
+  batch_size: 4
+  num_workers: 8
+  gradient_accumulation_steps: 4    # higher accum due to 12B model
+
+  mixed_precision: bf16
+  ema_decay: 0.9999
+  save_every: 1000
+  keep_last: 3
+  gc_interval: 5001
+
+  fsdp:
+    enable: true
+    sharding_strategy: FULL_SHARD       # 12B + diffusion head + (optional) MTA needs FULL_SHARD
+    state_dict_type: SHARDED_STATE_DICT
+    mixed_precision:
+      param_dtype: bf16
+      reduce_dtype: bf16
+      cast_root_forward_inputs: true
+
+# =============================================================================
+# Logging / wandb (optional)
+# =============================================================================
+
+wandb:
+  project: tuna2-gemma-pixel
+  name: ${oc.env:RUN_NAME,s1_default}
+  tags: ["s1", "image", "gemma4"]

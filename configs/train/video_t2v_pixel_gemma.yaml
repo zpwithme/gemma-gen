@@ -1,0 +1,130 @@
+# Pixel-space video training config for Tuna-2 + Gemma 4 12B.
+#
+# Three training modes selected via `training.stage`:
+#   * "joint_bidir" (V-S2): image + short video, bidirectional within video
+#                           — produces the bidirectional teacher used in S4.
+#   * "ar_teacher_force" (V-S3): cross-frame causal mask, teacher-forcing AR.
+#   * "mean_flow_distill" (V-S4): distill V-S3 teacher into few-step student.
+#
+# Per HunyuanVideo / MovieGen experience, keep image batches mixed in at every
+# stage to prevent catastrophic forgetting of image-space semantics.
+
+defaults:
+  - model: tuna_2_pixel_gemma_12b
+  - _self_
+
+# Override video-specific model settings
+model:
+  reshape_frame_to_batch_dim: false
+
+# =============================================================================
+# Data — image + video joint training (5:1 image:video ratio)
+# =============================================================================
+
+data:
+  sync_sampling: true
+  sampling_weights:
+    t2i: 0.50           # heavy image to stabilize
+    t2v_short: 0.30     # 4-frame short video
+    t2v_long: 0.10      # 8-16-frame longer video (V-S3+ only)
+    text: 0.10
+
+  streams:
+    t2i:
+      _target_: tuna.data.datasets.ti_dataset.TIDataset
+      jsonl_path: ./data_examples/ti_pairs.jsonl
+      image_root: ./data_examples
+      image_size: 512
+      data_type: t2i
+      max_text_length: 2048
+      center_crop: true
+      multi_resolution: false
+      batch_size: 4
+      num_workers: 8
+
+    t2v_short:
+      _target_: tuna.data.datasets.pixel_video_dataset.PixelVideoDataset
+      jsonl_path: ./data_examples/video_pairs.jsonl
+      image_root: ./data_examples
+      image_size: [512, 512]
+      num_frames: 4
+      patch_size: 16
+      max_text_length: 4096
+      center_crop: true
+      per_frame_spans: true
+      data_type: t2v_pixel
+      batch_size: 1
+      num_workers: 4
+
+    t2v_long:
+      _target_: tuna.data.datasets.pixel_video_dataset.PixelVideoDataset
+      jsonl_path: ./data_examples/video_pairs.jsonl
+      image_root: ./data_examples
+      image_size: [512, 512]
+      num_frames: 16
+      patch_size: 16
+      max_text_length: 8192
+      center_crop: true
+      per_frame_spans: true
+      data_type: t2v_pixel
+      batch_size: 1
+      num_workers: 4
+
+    text:
+      _target_: tuna.data.datasets.ti_dataset.TIDataset
+      jsonl_path: ./data_examples/text_only.jsonl
+      image_root: ./data_examples
+      image_size: 512
+      data_type: mmu_text
+      max_text_length: 4096
+      center_crop: true
+      batch_size: 3
+      num_workers: 4
+
+# =============================================================================
+# Training
+# =============================================================================
+
+training:
+  output_dir: ./outputs/video_t2v_pixel_gemma
+  # Set per-stage:
+  #   V-S2: stage=joint_bidir  -> use omni_attn_mask_naive (cross_frame_causal=false)
+  #   V-S3: stage=ar_teacher_force -> cross_frame_causal=true, teacher forcing
+  #   V-S4: stage=mean_flow_distill -> use MeanFlowDistillationWrapper
+  stage: "joint_bidir"
+
+  max_epochs: 1
+  max_steps_per_epoch: 100000
+  learning_rate: 1.0e-5         # lower LR for video stage
+  weight_decay: 1.0e-2
+  warmup_steps: 500
+
+  batch_size: 1
+  num_workers: 4
+  gradient_accumulation_steps: 8
+
+  mixed_precision: bf16
+  ema_decay: 0.9999
+
+  save_every: 500
+  keep_last: 3
+  gc_interval: 5001
+
+  fsdp:
+    enable: true
+    sharding_strategy: FULL_SHARD
+    state_dict_type: SHARDED_STATE_DICT
+    mixed_precision:
+      param_dtype: bf16
+      reduce_dtype: bf16
+      cast_root_forward_inputs: true
+
+# =============================================================================
+# Mean Flow distillation specific (only used when stage='mean_flow_distill')
+# =============================================================================
+
+mean_flow:
+  num_intervals: 4              # K — student inference steps
+  teacher_substeps: 4
+  teacher_ckpt: null             # path to V-S3 checkpoint (required for V-S4)
+  loss_type: "l2"

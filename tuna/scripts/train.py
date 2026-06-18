@@ -143,6 +143,67 @@ def main(cfg: DictConfig) -> None:
     logger.info("Instantiating model + dataset from config...")
     model = instantiate(cfg.model)
 
+    # ---- Stage routing (video AR pipeline) --------------------------------
+    # `training.stage` selects between three video-training modes:
+    #   * "joint_bidir"      — image + video joint training, bidirectional
+    #                          attention across all visual tokens (default,
+    #                          same as standard Tuna behavior). Produces the
+    #                          teacher used by V-S4.
+    #   * "ar_teacher_force" — cross-frame causal mask, teacher-forcing AR.
+    #                          The training data still feeds GT past frames
+    #                          but the model is trained with the AR mask, so
+    #                          inference rollout matches training.
+    #   * "mean_flow_distill" — wrap the model in a Mean Flow distillation
+    #                          wrapper so each train step distills a many-step
+    #                          teacher into a few-step student.
+    stage = cfg.training.get("stage", "joint_bidir") if "training" in cfg else "joint_bidir"
+    if stage == "ar_teacher_force":
+        # Enable cross-frame causal for video data inside the wrapper's mask
+        # builder. The wrapper checks this attribute when building masks.
+        if hasattr(model, "_video_cross_frame_causal"):
+            model._video_cross_frame_causal = True
+        else:
+            setattr(model, "_video_cross_frame_causal", True)
+        logger.info(
+            "[Stage] ar_teacher_force: enabled cross-frame causal mask for video data"
+        )
+    elif stage == "mean_flow_distill":
+        from tuna.training.mean_flow_distill import MeanFlowDistillationWrapper
+
+        teacher_ckpt = cfg.get("mean_flow", {}).get("teacher_ckpt", None)
+        if teacher_ckpt is None:
+            raise ValueError(
+                "Stage 'mean_flow_distill' requires `mean_flow.teacher_ckpt` "
+                "(path to V-S3 checkpoint) in the config."
+            )
+        # Build a frozen-copy teacher with the same arch as student.
+        teacher = instantiate(cfg.model)
+        ckpt = torch.load(teacher_ckpt, map_location="cpu")
+        sd = ckpt.get("state_dict", ckpt)
+        teacher.load_state_dict(sd, strict=False)
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad = False
+        model = MeanFlowDistillationWrapper(
+            student_model=model,
+            teacher_model=teacher,
+            num_intervals=cfg.mean_flow.get("num_intervals", 4),
+            teacher_substeps=cfg.mean_flow.get("teacher_substeps", 4),
+            loss_type=cfg.mean_flow.get("loss_type", "l2"),
+        )
+        logger.info(
+            f"[Stage] mean_flow_distill: wrapped model in MeanFlowDistillationWrapper "
+            f"(K={cfg.mean_flow.get('num_intervals', 4)}, "
+            f"teacher_ckpt={teacher_ckpt})"
+        )
+    elif stage == "joint_bidir":
+        logger.info("[Stage] joint_bidir: default Tuna behavior (no special routing)")
+    else:
+        raise ValueError(
+            f"Unknown training.stage: {stage!r}. "
+            "Choose one of: joint_bidir, ar_teacher_force, mean_flow_distill."
+        )
+
     # Build dataloader(s). Supports two config shapes:
     #   (a) Single dataset: cfg.data has _target_ → one DataLoader.
     #   (b) Multi-stream: cfg.data has `streams` + `sampling_weights`

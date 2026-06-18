@@ -22,12 +22,14 @@ from tuna.pipelines.reconstruction import reconstruct
 from tuna.pipelines.tuna_2_pixel_pipeline import Tuna2PixelPipeline
 from tuna.pipelines.tuna_2r_pixel_pipeline import Tuna2RPixelPipeline
 from tuna.pipelines.tuna_pipeline import TunaPipeline
+from tuna.pipelines.tuna_2_pixel_ar_video_pipeline import Tuna2PixelARVideoPipeline
 from tuna.pipelines.understanding import understand
 
 __all__ = [
     "TunaPipeline",
     "Tuna2RPixelPipeline",
     "Tuna2PixelPipeline",
+    "Tuna2PixelARVideoPipeline",
     "generate",
     "understand",
     "edit",
